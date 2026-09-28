@@ -1,0 +1,5 @@
+# Executaveis e artefatos de compilacao
+*.exe
+*.o
+*.obj
+*.docx
