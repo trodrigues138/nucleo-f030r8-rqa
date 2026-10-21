@@ -1,181 +1,173 @@
 /*
- * Analise de Quantificacao de Recorrencia (RQA) para EEG sintetico.
+ * =============================================================================
+ * RQA portatil — determinismo (DET) de janelas de EEG lidas de arquivo
+ * =============================================================================
  *
- * Esta implementacao usa dimensao de imersao m=1 e atraso tau=1:
- * cada estado e uma unica amplitude, sem reconstrucao multidimensional
- * do espaco de fases. A matriz registra pares cuja distancia absoluta
- * nao ultrapassa EPSILON. O DET mede a fracao desses pontos organizada
- * em linhas diagonais. Os modos interictal e ictal sao modelos sinteticos
- * didaticos; o resultado nao constitui diagnostico clinico.
+ * Apresentacao
+ *   Calcula o determinismo da Analise de Quantificacao de Recorrencia
+ *   com imersao m = 1 e atraso tau = 1. Nessa imersao o estado no
+ *   instante i e so a amplitude u(i). Dois instantes recorrem quando
+ *   |u(i) - u(j)| <= EPSILON. O DET e a fracao desses pares, contados
+ *   uma vez no triangulo superior, que segue proxima ao longo de uma
+ *   diagonal de comprimento >= L_MIN:
  *
- * Restricoes academicas:
- *   - sem alocacao dinamica (malloc, calloc, free): tudo estatico em .bss
- *   - sem recursao: 100% iterativo
- *   - math.h apenas com funcoes de precisao simples (sinf, cosf, fabsf)
+ *     DET = pontos em diagonais com L >= L_MIN
+ *           ------------------------------------
+ *           pontos com R(i,j) = 1 e j > i
  *
- * Compilacao:
- *   gcc -std=c11 -O2 rqa_portable.c -o rqa_portable.exe -lm
+ *   DET perto de 1: recorrencias alinhadas em trechos parecidos.
+ *   DET perto de 0: recorrencias isoladas. O limiar 0,70 separa os
+ *   regimes deste experimento. Nao e criterio clinico.
  *
- * Mapa de memoria dos buffers:
- *   eeg_sinal[88]                 352 bytes
- *   matriz_recorrencia[88][88]   7744 bytes
- *   total                        8096 bytes
+ * Autor
+ *  Tales Rodrigues
+ *  Ayslana Riene
+ *
+ * Data
+ *   27/09/2026 (nucleo do RQA). 07/10/2026 (esta versao de arquivo).
+ *
+ * Contexto
+ *   Trabalho de disciplina. O algoritmo foi dimensionado para a SRAM
+ *   de 8 KiB da placa NUCLEO-F030R8. Este arquivo e a bancada no PC:
+ *   confirma o DET em janelas reais antes de levar a mesma conta ao
+ *   microcontrolador (rqa_embedded.c).
+ *
+ * Plataforma alvo
+ *   Algoritmo: NUCLEO-F030R8, STM32F030R8, ARM Cortex-M0, sem FPU,
+ *   8 KiB de SRAM, sem heap.
+ *   Este executavel: PC com gcc em C11. A memoria continua estatica,
+ *   como no alvo.
+ *
+ * Permissao de uso (copyright)
+ *   Codigo academico de Tales Rodrigues, 2026. Pode ser lido, compilado
+ *   e adaptado em atividades de ensino, com citacao do autor.
+ *   Nao autoriza uso clinico nem diagnostico.
+ *   Registros CHB-MIT usados pela validacao nao fazem parte deste
+ *   fonte e permanecem sob a licenca da base (PhysioNet).
+ *
+ * Origem do codigo
+ *   Proprio: main, processar e o formato de entrada e saida.
+ *   Legado: calcular_rqa repete a conta ja escrita em rqa_embedded.c
+ *   (mesmo projeto). Nao ha trecho copiado de biblioteca externa.
+ *   Gerado: nenhum. Nao ha saida de STM32CubeMX, HAL ou gerador.
+ *
+ * Como usar
+ *   gcc -std=c11 -O2 -Wall -Wextra rqa_portable.c -o rqa_portable.exe -lm
+ *   rqa_portable.exe
+ *   rqa_portable.exe trechos_eeg.txt resultados_c.txt
+ *   rqa_portable.exe <entrada.txt> <saida.txt>
+ *
+ *   Sem argumentos, le trechos_eeg.txt e grava resultados_c.txt no
+ *   diretorio corrente. rqa_validacao.py gera a entrada a partir de
+ *   um .edf e chama este programa.
+ *
+ * Entrada (texto ASCII)
+ *   Primeira linha: inteiro, quantidade de trechos (> 0).
+ *   Cada trecho ocupa duas linhas:
+ *     id inicio_amostra inicio_s rotulo
+ *       id              int
+ *       inicio_amostra long, indice da primeira amostra no registro
+ *       inicio_s        double, instante inicial em segundos
+ *       rotulo          int, gabarito da crise: 1 dentro, 0 fora
+ *     em seguida, N = 88 amostras float, separadas por espaco.
+ *   O rotulo segue para a saida e nao entra no calculo.
+ *
+ * Saida
+ *   Texto ASCII, uma linha por trecho, nesta ordem:
+ *     id                    int
+ *     inicio_amostra        long
+ *     inicio_s              double com 6 casas
+ *     rotulo                int (o mesmo da entrada)
+ *     pontos_em_linhas      inteiro sem sinal, numerador do DET
+ *     recorrencias          inteiro sem sinal, denominador do DET
+ *     determinismo_det      float impresso em decimal
+ *     anomalia_transicao_estado   0 ou 1 (1 se DET > 0,70)
+ *   Sucesso: mensagem em stdout com a quantidade gravada e retorno 0.
+ *   Erro de abertura ou de formato: mensagem em stderr e retorno 1.
+ *   A saida e aberta em modo escrita e substitui o arquivo anterior.
+ *
+ * Restricoes herdadas do alvo
+ *   Sem malloc, calloc, free ou recursao. math.h entra so por fabsf.
+ *   Buffers estaticos: eeg_sinal[88] (352 bytes) e
+ *   matriz_recorrencia[88][88] (7744 bytes), 8096 bytes no total.
+ * =============================================================================
  */
 
 #include <stdint.h>
-#include <math.h>
 #include <stdio.h>
+#include <math.h>
 
-/* ------------------------------------------------------------------ */
-/*  Parametros do algoritmo                                            */
-/* ------------------------------------------------------------------ */
+#define N       88     /* amostras da janela; a 256 Hz, cerca de 344 ms */
+#define EPSILON 8.0f   /* |u(i) - u(j)| dentro deste raio marca recorrencia */
+#define L_MIN   2      /* menor diagonal contada no numerador do DET */
+#define LIMIAR  0.70f  /* DET acima disto marca mudanca de regime aqui */
 
-#define N       88
-#define EPSILON 8.0f  /* valor empirico para os sinais sinteticos */
-#define L_MIN   2
+/* Janela corrente, lida do arquivo. Unidade: a do texto de entrada. */
+static float eeg_sinal[N];
 
-#define PI_F      3.14159265f
-#define DOIS_PI_F 6.28318530f
-
-/*
- * Taxa de amostragem e frequencias angulares por amostra (rad/amostra).
- * Cada constante W_xxx = 2*pi*f/Fs, onde f e a frequencia em Hz e Fs a
- * taxa de amostragem. Os valores correspondem as bandas clinicas do EEG
- * de escalpo segundo a classificacao da IFCN (International Federation
- * of Clinical Neurophysiology).
- */
-#define FS          256.0f
-
-#define W_DELTA     0.04908739f   /*  2 Hz — banda delta             */
-#define W_THETA     0.14726216f   /*  6 Hz — banda theta             */
-#define W_ALPHA     0.24543693f   /* 10 Hz — banda alfa              */
-#define W_BETA      0.51541754f   /* 21 Hz — banda beta              */
-#define W_GAMMA     0.85902924f   /* 35 Hz — banda gama baixa        */
-
-#define W_CRISE     0.07363108f   /*  3 Hz — ritmo ictal fundamental */
-#define W_CRISE_H1  0.14726216f   /*  6 Hz — 1o harmonico            */
-#define W_CRISE_H2  0.22089323f   /*  9 Hz — 2o harmonico            */
-
-/* ------------------------------------------------------------------ */
-/*  Buffers estaticos e variaveis de inspecao                          */
-/* ------------------------------------------------------------------ */
-
-static float   eeg_sinal[N];
+/* Recurrence plot R(i,j): 1 se as amplitudes recorrem, 0 caso contrario. */
 static uint8_t matriz_recorrencia[N][N];
 
-float   determinismo_det;
-uint8_t anomalia_transicao_estado;
-uint8_t simular_anomalia;
+/* Ultimo trecho calculado. pontos_em_linhas e o numerador do DET. */
+static float determinismo_det;
 
+/* 1 se determinismo_det > LIMIAR, 0 caso contrario. */
+static uint8_t anomalia_transicao_estado;
+
+/* Numerador do DET: pontos que pertencem a diagonais com L >= L_MIN. */
+static uint32_t pontos_em_linhas;
+
+/* Denominador do DET: pares com R(i,j) = 1 e j > i. */
+static uint32_t recorrencias;
+
+/* float de 32 bits e os dois buffers somando 8096 bytes. */
 _Static_assert(sizeof(float) == 4u, "float deve ter 32 bits");
-
-/* ------------------------------------------------------------------ */
-/*  Geracao de sinal sintetico                                         */
-/* ------------------------------------------------------------------ */
+_Static_assert(sizeof(eeg_sinal) + sizeof(matriz_recorrencia) == 8096u,
+               "buffers do RQA devem ocupar 8096 bytes");
 
 /*
- * Modelo didatico: soma de senoides e ruido, nao EEG clinico medido.
+ * calcular_rqa
  *
- * simular_anomalia == 0 (modelo interictal sintetico):
- *   Composicao inspirada em cinco bandas do EEG de escalpo: alfa
- *   dominante, theta e delta de fundo, beta e gama de baixa amplitude,
- *   mais ruido pseudoaleatorio.
- *   A mistura de frequencias nao harmonicas e o ruido produzem um
- *   trecho irregular com DET baixo (~0.55).
+ * Comportamento
+ *   Monta a matriz de recorrencia a partir de eeg_sinal, mede as
+ *   diagonais do triangulo superior e grava DET e a classificacao.
  *
- * simular_anomalia == 1 (modelo ictal sintetico):
- *   Ritmo de 3 Hz e harmonicos de 6 Hz e 9 Hz aproximam uma forma
- *   spike-and-wave. O menor ruido representa apenas um regime mais
- *   organizado no modelo e favorece DET alto (~0.89); nao modela toda
- *   a fisiologia de uma crise nem comprova sincronizacao cortical.
+ *   A matriz inteira e preenchida: R e simetrica e a diagonal principal
+ *   vale sempre 1, porque cada amostra coincide consigo mesma. A conta
+ *   usa so j > i, para nao repetir o par (j, i) nem incluir essa diagonal.
  *
- * A semente do LCG e rearmada a cada chamada para garantir
- * reprodutibilidade entre execucoes.
+ *   Uma linha diagonal comeca em R(i,j) = 1 cujo antecessor R(i-1, j-1)
+ *   vale 0 ou cai fora da matriz. Cada ponto recorrente entra em no
+ *   maximo uma linha. Um ponto isolado (comprimento 1) fica somente
+ *   no denominador. Se nao ha par recorrente, o DET fica 0.
+ *
+ * Parametros
+ *   Nenhum.
+ *
+ * Retorno
+ *   Nenhum (void).
+ *
+ * Globais afetadas
+ *   Le:  eeg_sinal.
+ *   Escreve: matriz_recorrencia, pontos_em_linhas, recorrencias,
+ *            determinismo_det, anomalia_transicao_estado.
  */
-void gerar_sinal_dinamica(void)
+static void calcular_rqa(void)
 {
-    uint_fast16_t i;
-    uint32_t estado_ruido = 1u;
+    uint_fast16_t i;           /* linha da matriz */
+    uint_fast16_t j;           /* coluna da matriz */
+    uint_fast16_t k;           /* passo ao longo da diagonal */
+    uint_fast16_t comprimento; /* amostras contiguas da diagonal corrente */
+    uint32_t total = 0u;       /* denominador: R(i,j) = 1 com j > i */
+    uint32_t soma = 0u;        /* numerador: pontos em diagonais longas */
 
-    if (simular_anomalia == 0u) {
-        for (i = 0u; i < N; i++) {
-            float t = (float)i;
-            float ruido;
-            float amostra;
-
-            estado_ruido = (estado_ruido * 1664525u) + 1013904223u;
-            ruido = (float)(estado_ruido >> 8) * (1.0f / 16777216.0f);
-            ruido = (ruido * 2.0f) - 1.0f;
-
-            amostra  = 12.0f * sinf(W_ALPHA * t);    /* alfa 10 Hz  */
-            amostra +=  8.0f * cosf(W_THETA * t);    /* theta 6 Hz  */
-            amostra +=  5.0f * sinf(W_BETA  * t);    /* beta 21 Hz  */
-            amostra +=  2.0f * sinf(W_GAMMA * t);    /* gama 35 Hz  */
-            amostra +=  2.0f * cosf(W_DELTA * t);    /* delta 2 Hz  */
-            amostra += 14.0f * ruido;                 /* ruido bio.  */
-            eeg_sinal[i] = amostra;
-        }
-    } else {
-        for (i = 0u; i < N; i++) {
-            float t = (float)i;
-            float ruido;
-            float amostra;
-
-            estado_ruido = (estado_ruido * 1664525u) + 1013904223u;
-            ruido = (float)(estado_ruido >> 8) * (1.0f / 16777216.0f);
-            ruido = (ruido * 2.0f) - 1.0f;
-
-            amostra  = 22.0f * sinf(W_CRISE    * t); /* 3 Hz fund.  */
-            amostra += 10.0f * sinf(W_CRISE_H1 * t); /* 6 Hz harm.  */
-            amostra +=  5.0f * sinf(W_CRISE_H2 * t); /* 9 Hz harm.  */
-            amostra +=  5.0f * ruido;                 /* ruido resid. */
-            eeg_sinal[i] = amostra;
-        }
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/*  Calculo do RQA (Recurrence Quantification Analysis)                */
-/* ------------------------------------------------------------------ */
-
-/*
- * Etapa 1 — Construcao da matriz de recorrencia:
- *   R(i,j) = 1 se |x(i) - x(j)| <= EPSILON, senao 0.
- *   Como m=1, x(i) e somente a amplitude da amostra i.
- *   O denominador do DET conta apenas o triangulo superior (j > i).
- *   A matriz e simetrica e a diagonal principal (i == j) e trivialmente
- *   1, portanto so o triangulo superior evita contagem dupla e exclui
- *   a linha de identidade.
- *
- * Etapa 2 — Deteccao de linhas diagonais:
- *   Tres lacos percorrem o triangulo superior. Uma linha diagonal comeca
- *   num ponto R(i,j)==1 cujo antecessor (i-1, j-1) vale 0 ou esta fora
- *   da matriz. O terceiro laco mede o comprimento contiguo. Cada ponto
- *   recorrente pertence a no maximo uma linha, mantendo DET em [0, 1].
- *   DET = (soma dos comprimentos com L >= L_MIN) / (total de R(i,j)==1)
- *
- * Etapa 3 — Classificacao:
- *   O limiar empirico 0.70 separa somente os dois sinais deste teste;
- *   nao e um limiar clinico validado.
- */
-void calcular_rqa(void)
-{
-    uint_fast16_t i;
-    uint_fast16_t j;
-    uint_fast16_t k;
-    uint_fast16_t comprimento;
-    uint32_t total_pontos_recorrentes = 0u;
-    uint32_t soma_comprimentos = 0u;
-    float distancia;
-
-    /* Etapa 1: construir a matriz e contar recorrencias no triangulo superior */
+    /* Etapa 1: R(i,j) = 1 se as amplitudes estao a no maximo EPSILON. */
     for (i = 0u; i < N; i++) {
         for (j = 0u; j < N; j++) {
-            distancia = fabsf(eeg_sinal[i] - eeg_sinal[j]);
-            if (distancia <= EPSILON) {
+            if (fabsf(eeg_sinal[i] - eeg_sinal[j]) <= EPSILON) {
                 matriz_recorrencia[i][j] = 1u;
                 if (j > i) {
-                    total_pontos_recorrentes++;
+                    total++;
                 }
             } else {
                 matriz_recorrencia[i][j] = 0u;
@@ -183,112 +175,14 @@ void calcular_rqa(void)
         }
     }
 
-    /* Etapa 2: varrer diagonais do triangulo superior */
+    /* Etapa 2: so o triangulo superior. O teste de inicio evita contar a mesma diagonal duas vezes. */
     for (i = 0u; i < N; i++) {
-        for (j = i + 1u; j < N; j++) {
-            uint_fast8_t inicio_de_linha = 0u;
+        for (j = (uint_fast16_t)(i + 1u); j < N; j++) {
+            uint_fast8_t inicio = 0u; /* 1 se (i, j) e o primeiro ponto da diagonal */
 
             if (matriz_recorrencia[i][j] == 1u) {
-                if (i == 0u) {
-                    inicio_de_linha = 1u;
-                } else if (matriz_recorrencia[i - 1u][j - 1u] == 0u) {
-                    inicio_de_linha = 1u;
-                }
-            }
-
-            if (inicio_de_linha != 0u) {
-                comprimento = 0u;
-                for (k = 0u;
-                     (i + k < N) && (j + k < N);
-                     k++) {
-                    if (matriz_recorrencia[i + k][j + k] == 1u) {
-                        comprimento++;
-                    } else {
-                        break;
-                    }
-                }
-
-                if (comprimento >= L_MIN) {
-                    soma_comprimentos += comprimento;
-                }
-            }
-        }
-    }
-
-    /* Etapa 3: calcular DET e classificar */
-    if (total_pontos_recorrentes == 0u) {
-        determinismo_det = 0.0f;
-    } else {
-        determinismo_det = (float)soma_comprimentos
-                         / (float)total_pontos_recorrentes;
-    }
-
-    if (determinismo_det > 0.70f) {
-        anomalia_transicao_estado = 1u;
-    } else {
-        anomalia_transicao_estado = 0u;
-    }
-
-    printf("simular_anomalia = %u\n", (unsigned)simular_anomalia);
-    printf("pontos_em_linhas = %lu\n", (unsigned long)soma_comprimentos);
-    printf("recorrencias = %lu\n", (unsigned long)total_pontos_recorrentes);
-    if (total_pontos_recorrentes == 0u) {
-        printf("razao_exata = 0\n");
-    } else {
-        printf("razao_exata = %.17g\n",
-               (double)soma_comprimentos / (double)total_pontos_recorrentes);
-    }
-    printf("determinismo_det = %.9g\n", (double)determinismo_det);
-    printf("anomalia_transicao_estado = %u\n\n",
-           (unsigned)anomalia_transicao_estado);
-}
-
-/* ------------------------------------------------------------------ */
-/*  Validacao: exemplo 5x5 com conta manual                           */
-/* ------------------------------------------------------------------ */
-
-/*
- * Serie [0, 1, 0, 1, 0], epsilon = 0.5.
- * Matriz de recorrencia (1 onde |x(i)-x(j)| <= 0.5):
- *
- *       0  1  2  3  4
- *   0 [ 1  0  1  0  1 ]
- *   1 [ 0  1  0  1  0 ]
- *   2 [ 1  0  1  0  1 ]
- *   3 [ 0  1  0  1  0 ]
- *   4 [ 1  0  1  0  1 ]
- *
- * Triangulo superior: (0,2)=1, (0,4)=1, (1,3)=1, (2,4)=1  -> total = 4
- * Linha diagonal d=2: (0,2),(1,3),(2,4) -> comprimento 3, >= L_MIN
- * Ponto isolado (0,4): comprimento 1, < L_MIN
- *
- * DET = 3 / 4 = 0.75
- */
-static int conferir_exemplo_5x5(void)
-{
-    const float x[5] = {0.0f, 1.0f, 0.0f, 1.0f, 0.0f};
-    const float epsilon = 0.5f;
-    uint8_t recorrencia[5][5];
-    unsigned total = 0u;
-    unsigned soma = 0u;
-    unsigned i;
-    unsigned j;
-
-    for (i = 0u; i < 5u; i++) {
-        for (j = 0u; j < 5u; j++) {
-            recorrencia[i][j] = (fabsf(x[i] - x[j]) <= epsilon) ? 1u : 0u;
-        }
-    }
-
-    for (i = 0u; i < 5u; i++) {
-        for (j = i + 1u; j < 5u; j++) {
-            unsigned comprimento;
-            unsigned k;
-            uint8_t inicio = 0u;
-
-            if (recorrencia[i][j] == 1u) {
-                total++;
-                if (i == 0u || recorrencia[i - 1u][j - 1u] == 0u) {
+                /* Borda da matriz, ou quebra da diagonal no passo anterior. */
+                if (i == 0u || matriz_recorrencia[i - 1u][j - 1u] == 0u) {
                     inicio = 1u;
                 }
             }
@@ -298,57 +192,153 @@ static int conferir_exemplo_5x5(void)
             }
 
             comprimento = 0u;
-            for (k = 0u; (i + k) < 5u && (j + k) < 5u; k++) {
-                if (recorrencia[i + k][j + k] == 1u) {
+            for (k = 0u; (i + k < N) && (j + k < N); k++) {
+                if (matriz_recorrencia[i + k][j + k] == 1u) {
                     comprimento++;
                 } else {
                     break;
                 }
             }
-            if (comprimento >= 2u) {
+
+            if (comprimento >= L_MIN) {
                 soma += comprimento;
             }
         }
     }
 
-    printf("exemplo_5x5 pontos_em_linhas = %u\n", soma);
-    printf("exemplo_5x5 recorrencias = %u\n", total);
-    printf("exemplo_5x5 razao_exata = %.17g\n\n",
-           (double)soma / (double)total);
-
-    if (total == 4u && soma == 3u) {
-        return 0;
+    /* Etapa 3: DET = soma / total. Sem recorrencias o quociente nao existe. */
+    pontos_em_linhas = soma;
+    recorrencias = total;
+    if (total == 0u) {
+        determinismo_det = 0.0f;
+    } else {
+        determinismo_det = (float)soma / (float)total;
     }
-    return 1;
+    anomalia_transicao_estado = (determinismo_det > LIMIAR) ? 1u : 0u;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Ponto de entrada                                                   */
-/* ------------------------------------------------------------------ */
-
-int main(void)
+/*
+ * processar
+ *
+ * Comportamento
+ *   Abre a entrada, le a quantidade de trechos e, para cada um, o
+ *   cabecalho e as N amostras. Chama calcular_rqa e acrescenta uma
+ *   linha na saida. Para no primeiro trecho incompleto.
+ *
+ * Parametros
+ *   entrada: caminho do texto com as janelas.
+ *   saida:   caminho do texto a criar. O modo "w" substitui o arquivo
+ *            que ja existir.
+ *
+ * Retorno
+ *   0 se todos os trechos anunciados no cabecalho foram gravados.
+ *   1 se um arquivo nao abre ou se o formato esta incompleto. Nesse
+ *   caso a saida pode ter ficado vazia ou so com os trechos anteriores.
+ *
+ * Globais afetadas
+ *   Nenhuma diretamente. A cada trecho, calcular_rqa le e escreve
+ *   eeg_sinal, matriz_recorrencia e as quatro globais de resultado.
+ */
+static int processar(const char *entrada, const char *saida)
 {
-    int falha = conferir_exemplo_5x5();
+    FILE *in;             /* arquivo de janelas */
+    FILE *out;            /* arquivo de resultados */
+    int quantidade;       /* numero de trechos anunciado na primeira linha */
+    int indice;           /* trecho corrente, de 0 a quantidade-1 */
+    int gravados = 0;     /* linhas ja escritas na saida */
 
-    simular_anomalia = 0u;
-    gerar_sinal_dinamica();
-    calcular_rqa();
-    if (!(determinismo_det <= 0.70f) || anomalia_transicao_estado != 0u) {
-        falha = 1;
+    in = fopen(entrada, "r");
+    if (in == NULL) {
+        fprintf(stderr, "nao foi possivel abrir %s\n", entrada);
+        return 1;
     }
 
-    simular_anomalia = 1u;
-    gerar_sinal_dinamica();
-    calcular_rqa();
-    if (!(determinismo_det > 0.70f) || anomalia_transicao_estado != 1u) {
-        falha = 1;
+    out = fopen(saida, "w");
+    if (out == NULL) {
+        fprintf(stderr, "nao foi possivel criar %s\n", saida);
+        fclose(in);
+        return 1;
     }
 
-    if (falha == 0) {
-        printf("conferencia: exemplo 5x5 = 3/4 e os dois modos em lados"
-               " opostos de 0.70\n");
-    } else {
-        printf("conferencia: resultado fora do esperado\n");
+    if (fscanf(in, "%d", &quantidade) != 1 || quantidade <= 0) {
+        fprintf(stderr, "cabecalho invalido em %s\n", entrada);
+        fclose(in);
+        fclose(out);
+        return 1;
     }
-    return falha;
+
+    for (indice = 0; indice < quantidade; indice++) {
+        long inicio_amostra;      /* indice da primeira amostra no registro */
+        double inicio_s;          /* instante inicial, em segundos */
+        int id;                   /* identificador do trecho */
+        int rotulo;               /* gabarito: 1 dentro da crise, 0 fora */
+        uint_fast16_t amostra;    /* posicao de 0 a N-1 dentro da janela */
+
+        if (fscanf(in, "%d %ld %lf %d",
+                   &id, &inicio_amostra, &inicio_s, &rotulo) != 4) {
+            fprintf(stderr, "cabecalho do trecho %d incompleto\n", indice);
+            fclose(in);
+            fclose(out);
+            return 1;
+        }
+
+        for (amostra = 0u; amostra < N; amostra++) {
+            if (fscanf(in, "%f", &eeg_sinal[amostra]) != 1) {
+                fprintf(stderr, "amostras incompletas no trecho %d\n", id);
+                fclose(in);
+                fclose(out);
+                return 1;
+            }
+        }
+
+        calcular_rqa();
+        fprintf(out,
+                "%d %ld %.6f %d %lu %lu %.9g %u\n",
+                id,
+                inicio_amostra,
+                inicio_s,
+                rotulo,
+                (unsigned long)pontos_em_linhas,
+                (unsigned long)recorrencias,
+                (double)determinismo_det,
+                (unsigned)anomalia_transicao_estado);
+        gravados++;
+    }
+
+    fclose(in);
+    fclose(out);
+    printf("gravados %d trechos em %s\n", gravados, saida);
+    return 0;
+}
+
+/*
+ * main
+ *
+ * Comportamento
+ *   Escolhe os caminhos da entrada e da saida e chama processar.
+ *
+ * Parametros
+ *   argc: quantidade de argumentos, incluindo o nome do programa.
+ *   argv: argv[1] e a entrada; argv[2] e a saida. Se faltarem, usam
+ *         trechos_eeg.txt e resultados_c.txt.
+ *
+ * Retorno
+ *   O codigo de processar: 0 em sucesso, 1 em erro de arquivo ou formato.
+ *
+ * Globais afetadas
+ *   Nenhuma diretamente. processar, por meio de calcular_rqa, altera
+ *   as globais do RQA.
+ */
+int main(int argc, char **argv)
+{
+    const char *entrada = "trechos_eeg.txt"; /* caminho padrao de leitura */
+    const char *saida = "resultados_c.txt";  /* caminho padrao de gravacao */
+
+    if (argc >= 2) {
+        entrada = argv[1];
+    }
+    if (argc >= 3) {
+        saida = argv[2];
+    }
+    return processar(entrada, saida);
 }

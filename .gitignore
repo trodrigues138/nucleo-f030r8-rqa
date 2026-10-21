@@ -3,3 +3,8 @@
 *.o
 *.obj
 *.docx
+.pio/
+STM32CubeIDE/Embedded/
+STM32CubeIDE/Embedded_Serial/
+STM32CubeIDE/Optimized/
+STM32CubeIDE/Optimized_Serial/

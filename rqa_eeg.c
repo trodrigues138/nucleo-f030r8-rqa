@@ -1,4 +1,59 @@
 /*
+ * =============================================================================
+ * RQA com conferencia no PC e o mesmo laco no microcontrolador
+ * =============================================================================
+ *
+ * Apresentacao
+ *   Variante do firmware que, compilada no laptop com -DRQA_LAPTOP,
+ *   imprime o DET e confere um exemplo 5x5 de resultado conhecido.
+ *   Sem essa macro, o comportamento e o laco do alvo: gera o sinal
+ *   e recalcula o RQA sem stdio.
+ *
+ * Autor
+ *   Tales Rodrigues
+ *
+ * Data
+ *   27/09/2026
+ *
+ * Contexto
+ *   Trabalho de disciplina. Serve para ver a conta no terminal antes
+ *   de observar as mesmas globais no depurador da NUCLEO-F030R8.
+ *
+ * Plataforma alvo
+ *   Alvo: NUCLEO-F030R8, STM32F030R8, Cortex-M0, sem FPU, 8 KiB SRAM.
+ *   Bancada: PC com gcc, somente se -DRQA_LAPTOP estiver definido.
+ *
+ * Permissao de uso (copyright)
+ *   Codigo academico de Tales Rodrigues, 2026. Pode ser lido, compilado
+ *   e adaptado em atividades de ensino, com citacao do autor.
+ *   Nao autoriza uso clinico nem diagnostico.
+ *
+ * Origem do codigo
+ *   Proprio: sinal sintetico, RQA, exemplo 5x5 e os dois main.
+ *   Legado: a reducao de seno e o mesmo recurso de rqa_embedded.c;
+ *   o ruido usa o gerador de Numerical Recipes.
+ *   Gerado: nenhum.
+ *
+ * Como usar
+ *   No PC:
+ *     gcc -std=c11 -DRQA_LAPTOP -O2 rqa_eeg.c -o rqa_eeg.exe -lm
+ *     rqa_eeg.exe
+ *   No alvo: compile sem -DRQA_LAPTOP, Heap_Size = 0, Stack_Size = 0x50,
+ *   e inspecione simular_anomalia, determinismo_det e
+ *   anomalia_transicao_estado pelo depurador.
+ *
+ * Entrada
+ *   No PC, nenhuma: main testa os dois modos em sequencia.
+ *   No alvo, simular_anomalia (uint8_t), escrito pelo depurador.
+ *   0: mistura irregular. 1: seno de periodo 16.
+ *
+ * Saida
+ *   No PC, texto em stdout com o exemplo 5x5 (3/4), o DET de cada modo
+ *   e o codigo 0 se a conferencia fecha, 1 se nao fecha.
+ *   No alvo, determinismo_det e anomalia_transicao_estado. O main
+ *   do alvo nao retorna.
+ * =============================================================================
+ *
  * Analise de Quantificacao de Recorrencia (RQA) para um EEG sintetico.
  * Alvo: STM32F030R8 (NUCLEO-F030R8), ARM Cortex-M0, sem FPU, 8 KiB de SRAM.
  *
@@ -99,8 +154,20 @@ static float seno_reduzido(float x);
 static float cosseno_reduzido(float x);
 
 /*
- * sinf apenas com |angulo| no trecho do polinomio. No bordo pi/4,
- * sen e cos valem o mesmo e a constante evita rem_pio2.
+ * seno_faixa_segura
+ *
+ * Comportamento
+ *   sinf apenas com |angulo| no trecho do polinomio. No bordo pi/4,
+ *   sen e cos valem o mesmo e a constante evita rem_pio2.
+ *
+ * Parametros
+ *   angulo: radianos, ja reduzidos a cerca de pi/4.
+ *
+ * Retorno
+ *   Seno do angulo, em float.
+ *
+ * Globais afetadas
+ *   Nenhuma.
  */
 static float seno_faixa_segura(float angulo)
 {
@@ -118,6 +185,22 @@ static float seno_faixa_segura(float angulo)
     return SIN_PI_4_F;
 }
 
+/*
+ * cosseno_faixa_segura
+ *
+ * Comportamento
+ *   cosf apenas com |angulo| no trecho do polinomio. No bordo pi/4
+ *   devolve SIN_PI_4_F e nao chama rem_pio2.
+ *
+ * Parametros
+ *   angulo: radianos, ja reduzidos a cerca de pi/4.
+ *
+ * Retorno
+ *   Cosseno do angulo, em float.
+ *
+ * Globais afetadas
+ *   Nenhuma.
+ */
 static float cosseno_faixa_segura(float angulo)
 {
     if (angulo < 0.0f) {
@@ -131,9 +214,21 @@ static float cosseno_faixa_segura(float angulo)
 }
 
 /*
- * sen(x) para x >= 0, com uma unica chamada a sinf ou cosf.
- * A reducao modulo 2*pi cabe em float32 porque os angulos daqui
- * ficam abaixo de ~40 voltas (indice 0..87).
+ * seno_reduzido
+ *
+ * Comportamento
+ *   sen(x) para x >= 0, com uma unica chamada a sinf ou cosf.
+ *   A reducao modulo 2*pi cabe em float32 porque os angulos daqui
+ *   ficam abaixo de cerca de 40 voltas (indice 0..87).
+ *
+ * Parametros
+ *   x: angulo em radianos.
+ *
+ * Retorno
+ *   Seno de x, em float.
+ *
+ * Globais afetadas
+ *   Nenhuma.
  */
 static float seno_reduzido(float x)
 {
@@ -178,7 +273,21 @@ static float seno_reduzido(float x)
     return -cosseno_faixa_segura(angulo - TRES_MEIO_PI_F);
 }
 
-/* cos(x) = sen(x + pi/2), com a mesma reducao de argumento. */
+/*
+ * cosseno_reduzido
+ *
+ * Comportamento
+ *   cos(x) = sen(x + pi/2), com a mesma reducao de argumento.
+ *
+ * Parametros
+ *   x: angulo em radianos.
+ *
+ * Retorno
+ *   Cosseno de x, em float.
+ *
+ * Globais afetadas
+ *   Nenhuma.
+ */
 static float cosseno_reduzido(float x)
 {
     return seno_reduzido(x + MEIO_PI_F);
@@ -193,6 +302,16 @@ static float cosseno_reduzido(float x)
  * diagonais de periodicidade atravessam a matriz. DET perto de 0.88.
  * A semente do LCG e rearmada a cada chamada para o Live Watch nao
  * oscilar entre iteracoes.
+ *
+ * Parametros
+ *   Nenhum.
+ *
+ * Retorno
+ *   Nenhum (void).
+ *
+ * Globais afetadas
+ *   Le: simular_anomalia.
+ *   Escreve: eeg_sinal.
  */
 void gerar_sinal_dinamica(void)
 {
@@ -280,6 +399,18 @@ void gerar_sinal_dinamica(void)
  *   DET = (soma dos comprimentos com L >= L_MIN) / (pontos com R == 1)
  *
  * Etapa 3. DET acima de 0.70 marca a transicao para o regime ritmico.
+ * Com RQA_LAPTOP, imprime tambem os inteiros da conta.
+ *
+ * Parametros
+ *   Nenhum.
+ *
+ * Retorno
+ *   Nenhum (void).
+ *
+ * Globais afetadas
+ *   Le: eeg_sinal e, na impressao, simular_anomalia.
+ *   Escreve: matriz_recorrencia, determinismo_det,
+ *   anomalia_transicao_estado.
  */
 void calcular_rqa(void)
 {
@@ -366,6 +497,23 @@ void calcular_rqa(void)
 }
 
 #ifdef RQA_LAPTOP
+/*
+ * conferir_exemplo_5x5
+ *
+ * Comportamento
+ *   Aplica o mesmo RQA a serie [0, 1, 0, 1, 0] com epsilon 0,5.
+ *   A mao, o triangulo superior tem 4 recorrencias e uma diagonal
+ *   de comprimento 3. Imprime esses inteiros.
+ *
+ * Parametros
+ *   Nenhum.
+ *
+ * Retorno
+ *   0 se o total e 4 e a soma e 3. 1 caso contrario.
+ *
+ * Globais afetadas
+ *   Nenhuma. Usa so vetores locais.
+ */
 static int conferir_exemplo_5x5(void)
 {
     const float x[5] = {0.0f, 1.0f, 0.0f, 1.0f, 0.0f};
@@ -424,9 +572,27 @@ static int conferir_exemplo_5x5(void)
     return 1;
 }
 
+/*
+ * main (compilacao com -DRQA_LAPTOP)
+ *
+ * Comportamento
+ *   Confere o exemplo 5x5 e, em seguida, os dois modos sinteticos.
+ *   O modo 0 deve ficar em DET <= 0,70. O modo 1 deve passar de 0,70.
+ *
+ * Parametros
+ *   Nenhum.
+ *
+ * Retorno
+ *   0 se o exemplo e os dois modos fecham. 1 se algum falha.
+ *
+ * Globais afetadas
+ *   Escreve simular_anomalia. gerar_sinal_dinamica e calcular_rqa
+ *   alteram eeg_sinal, matriz_recorrencia, determinismo_det e
+ *   anomalia_transicao_estado.
+ */
 int main(void)
 {
-    int falha = conferir_exemplo_5x5();
+    int falha = conferir_exemplo_5x5(); /* 0 se o exemplo 5x5 fecha */
 
     simular_anomalia = 0u;
     gerar_sinal_dinamica();
@@ -450,6 +616,23 @@ int main(void)
     return falha;
 }
 #else
+/*
+ * main (compilacao do alvo, sem -DRQA_LAPTOP)
+ *
+ * Comportamento
+ *   Laco infinito: gera o sinal e recalcula o RQA. O depurador escreve
+ *   simular_anomalia e le as outras globais de inspecao.
+ *
+ * Parametros
+ *   Nenhum.
+ *
+ * Retorno
+ *   Declarado como int. O laco nao termina, entao nao devolve valor.
+ *
+ * Globais afetadas
+ *   Nenhuma diretamente. As funcoes chamadas alteram eeg_sinal,
+ *   matriz_recorrencia, determinismo_det e anomalia_transicao_estado.
+ */
 int main(void)
 {
     for (;;) {

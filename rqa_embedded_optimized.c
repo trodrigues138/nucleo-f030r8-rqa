@@ -1,6 +1,57 @@
 /*
+ * =============================================================================
+ * RQA embarcado otimizado — matriz em bits e comparacao em Q8.8
+ * =============================================================================
+ *
+ * Apresentacao
+ *   Mesma experiencia de rqa_embedded.c, com a matriz em 1 bit por
+ *   elemento e a distancia em inteiro Q8.8. A janela passa de 88 para
+ *   240 amostras e ainda cabe na SRAM de 8 KiB.
+ *
+ * Autor
+ *   Tales Rodrigues
+ *
+ * Data
+ *   27/09/2026
+ *
+ * Contexto
+ *   Trabalho de disciplina. Mostra o que muda no mesmo DET quando a
+ *   memoria da NUCLEO-F030R8 deixa de guardar um byte por recorrencia.
+ *
+ * Plataforma alvo
+ *   NUCLEO-F030R8, STM32F030R8, ARM Cortex-M0, sem FPU, 8 KiB de SRAM.
+ *   Inspecao somente pelo depurador. Sem UART e sem printf.
+ *
+ * Permissao de uso (copyright)
+ *   Codigo academico de Tales Rodrigues, 2026. Pode ser lido, compilado
+ *   e adaptado em atividades de ensino, com citacao do autor.
+ *   Nao autoriza uso clinico nem diagnostico.
+ *
+ * Origem do codigo
+ *   Proprio: empacotamento em bits, conversao Q8.8 e o laco inteiro
+ *   do DET, escritos sobre a conta de rqa_embedded.c.
+ *   Legado: geracao de sinal e reducao de seno, reaproveitadas de
+ *   rqa_embedded.c; ruido pelo gerador de Numerical Recipes.
+ *   Gerado: nenhum.
+ *
+ * Como usar
+ *   Substitua rqa_embedded.c por este fonte no projeto da placa.
+ *   Heap_Size = 0 e Stack_Size = 0x1F0. Escreva simular_anomalia
+ *   pelo depurador e leia determinismo_det e
+ *   anomalia_transicao_estado.
+ *
+ * Entrada
+ *   simular_anomalia (uint8_t): 0 mistura irregular, 1 ritmo de 3 Hz.
+ *   O sinal nasce em float e e guardado em int16_t Q8.8
+ *   (valor real = inteiro / 256).
+ *
+ * Saida
+ *   determinismo_det (float, 0 a 1) e anomalia_transicao_estado
+ *   (uint8_t, 1 se o DET passa de 0,70). main nao retorna.
+ * =============================================================================
+ *
  * Analise de Quantificacao de Recorrencia (RQA) para EEG sintetico.
- * Versao ultra-otimizada para ARM Cortex-M0 sem FPU.
+ * Versao otimizada para ARM Cortex-M0 sem FPU.
  *
  * Usa dimensao de imersao m=1 e atraso tau=1: cada estado e uma unica
  * amplitude, sem reconstrucao multidimensional do espaco de fases.
@@ -108,9 +159,10 @@
 static int16_t sinal_fixo[N];
 static uint8_t matriz_bits[N][BYTES_POR_LINHA];
 
-volatile float   determinismo_det;
-volatile uint8_t anomalia_transicao_estado;
-volatile uint8_t simular_anomalia;
+/* volatile: o depurador escreve simular_anomalia e le as outras duas. */
+volatile float   determinismo_det;          /* DET da ultima janela, 0 a 1 */
+volatile uint8_t anomalia_transicao_estado; /* 1 se DET > 0,70 */
+volatile uint8_t simular_anomalia;          /* 0 repouso sintetico, 1 ritmo */
 
 _Static_assert(sizeof(float) == 4u, "float deve ter 32 bits");
 _Static_assert(sizeof(int16_t) == 2u, "int16_t deve ter 16 bits");
@@ -144,12 +196,43 @@ _Static_assert(sizeof(sinal_fixo) + sizeof(matriz_bits)
  *   1 << k   -> MOV+LSL         (2 ciclos)
  *   |= mask  -> LDRB+ORR+STRB   (4 ciclos)
  *   >> + & 1 -> LDRB+LSR+AND    (3 ciclos)
+ *
+ * bit_set
+ *
+ * Comportamento
+ *   Liga o bit R(i,j) sem alterar os outros bits do mesmo byte.
+ *
+ * Parametros
+ *   i: linha, de 0 a N-1.
+ *   j: coluna, de 0 a N-1.
+ *
+ * Retorno
+ *   Nenhum (void).
+ *
+ * Globais afetadas
+ *   Escreve um bit de matriz_bits.
  */
 static inline void bit_set(uint_fast16_t i, uint_fast16_t j)
 {
     matriz_bits[i][j >> 3] |= (uint8_t)(1u << (j & 7u));
 }
 
+/*
+ * bit_get
+ *
+ * Comportamento
+ *   Le o bit R(i,j) do byte matriz_bits[i][j >> 3].
+ *
+ * Parametros
+ *   i: linha, de 0 a N-1.
+ *   j: coluna, de 0 a N-1.
+ *
+ * Retorno
+ *   1 se o par recorre, 0 caso contrario.
+ *
+ * Globais afetadas
+ *   Le matriz_bits. Nao escreve.
+ */
 static inline uint_fast8_t bit_get(uint_fast16_t i, uint_fast16_t j)
 {
     return (uint_fast8_t)((matriz_bits[i][j >> 3] >> (j & 7u)) & 1u);
@@ -159,6 +242,22 @@ static inline uint_fast8_t bit_get(uint_fast16_t i, uint_fast16_t j)
 /*  Funcoes trigonometricas com reducao de argumento segura            */
 /* ------------------------------------------------------------------ */
 
+/*
+ * seno_faixa_segura
+ *
+ * Comportamento
+ *   sinf apenas com |angulo| <= pi/4. No bordo devolve SIN_PI_4_F
+ *   e nao chama rem_pio2.
+ *
+ * Parametros
+ *   angulo: radianos, ja reduzidos a cerca de pi/4.
+ *
+ * Retorno
+ *   Seno do angulo, em float.
+ *
+ * Globais afetadas
+ *   Nenhuma.
+ */
 static float seno_faixa_segura(float angulo)
 {
     if (angulo < 0.0f) {
@@ -174,6 +273,21 @@ static float seno_faixa_segura(float angulo)
     return SIN_PI_4_F;
 }
 
+/*
+ * cosseno_faixa_segura
+ *
+ * Comportamento
+ *   cosf apenas com |angulo| <= pi/4. No bordo devolve SIN_PI_4_F.
+ *
+ * Parametros
+ *   angulo: radianos, ja reduzidos a cerca de pi/4.
+ *
+ * Retorno
+ *   Cosseno do angulo, em float.
+ *
+ * Globais afetadas
+ *   Nenhuma.
+ */
 static float cosseno_faixa_segura(float angulo)
 {
     if (angulo < 0.0f) {
@@ -185,6 +299,23 @@ static float cosseno_faixa_segura(float angulo)
     return SIN_PI_4_F;
 }
 
+/*
+ * seno_reduzido
+ *
+ * Comportamento
+ *   sen(x) com uma unica chamada a sinf ou cosf, depois de reduzir
+ *   o angulo modulo 2*pi e a um quadrante de pi/4.
+ *
+ * Parametros
+ *   x: angulo em radianos. Negativo e refletido; neste arquivo os
+ *   argumentos W*t sao nao negativos.
+ *
+ * Retorno
+ *   Seno de x, em float.
+ *
+ * Globais afetadas
+ *   Nenhuma.
+ */
 static float seno_reduzido(float x)
 {
     float voltas;
@@ -221,6 +352,21 @@ static float seno_reduzido(float x)
     return -cosseno_faixa_segura(angulo - TRES_MEIO_PI_F);
 }
 
+/*
+ * cosseno_reduzido
+ *
+ * Comportamento
+ *   cos(x) = sen(x + pi/2), com a mesma reducao de argumento.
+ *
+ * Parametros
+ *   x: angulo em radianos.
+ *
+ * Retorno
+ *   Cosseno de x, em float.
+ *
+ * Globais afetadas
+ *   Nenhuma.
+ */
 static float cosseno_reduzido(float x)
 {
     return seno_reduzido(x + MEIO_PI_F);
@@ -244,6 +390,16 @@ static float cosseno_reduzido(float x)
  *
  * Conversao: sinal_fixo[i] = (int16_t)(amostra * 256.0f)
  * Range do sinal: ~±35 -> ±8960 em Q8.8 (cabe em int16_t ±32767)
+ *
+ * Parametros
+ *   Nenhum.
+ *
+ * Retorno
+ *   Nenhum (void).
+ *
+ * Globais afetadas
+ *   Le: simular_anomalia.
+ *   Escreve: sinal_fixo.
  */
 void gerar_sinal_dinamica(void)
 {
@@ -316,6 +472,16 @@ void gerar_sinal_dinamica(void)
  *   A divisao soma/total e feita em float para manter a precisao
  *   fracionaria do DET. E uma unica divisao, executada uma vez. O
  *   limiar 0.70 separa apenas os sinais sinteticos deste experimento.
+ *
+ * Parametros
+ *   Nenhum.
+ *
+ * Retorno
+ *   Nenhum (void).
+ *
+ * Globais afetadas
+ *   Le: sinal_fixo.
+ *   Escreve: matriz_bits, determinismo_det, anomalia_transicao_estado.
  */
 void calcular_rqa(void)
 {
@@ -401,6 +567,24 @@ void calcular_rqa(void)
 /*  Ponto de entrada                                                   */
 /* ------------------------------------------------------------------ */
 
+/*
+ * main
+ *
+ * Comportamento
+ *   Laco infinito: gera o sinal em Q8.8 e recalcula o RQA.
+ *   O depurador escreve simular_anomalia e le o DET e o alarme.
+ *
+ * Parametros
+ *   Nenhum.
+ *
+ * Retorno
+ *   Declarado como int. O laco nao termina, entao nao devolve valor.
+ *
+ * Globais afetadas
+ *   Nenhuma diretamente. gerar_sinal_dinamica escreve sinal_fixo.
+ *   calcular_rqa escreve matriz_bits, determinismo_det e
+ *   anomalia_transicao_estado.
+ */
 int main(void)
 {
     for (;;) {

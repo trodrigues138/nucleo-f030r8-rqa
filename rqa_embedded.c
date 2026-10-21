@@ -1,6 +1,61 @@
 /*
+ * =============================================================================
+ * RQA embarcado — determinismo de um EEG sintetico na NUCLEO-F030R8
+ * =============================================================================
+ *
+ * Apresentacao
+ *   Firmware de referencia do trabalho. Gera uma janela sintetica e
+ *   calcula o determinismo (DET) da Analise de Quantificacao de
+ *   Recorrencia, com m = 1 e tau = 1. Nao le arquivo e nao escreve
+ *   na serial: o depurador observa o resultado.
+ *
+ * Autor
+ *   Tales Rodrigues
+ *
+ * Data
+ *   27/09/2026
+ *
+ * Contexto
+ *   Trabalho de disciplina. Demonstra o nucleo da RQA dentro de
+ *   8 KiB de SRAM, sem heap e sem recursao.
+ *
+ * Plataforma alvo
+ *   NUCLEO-F030R8, STM32F030R8, ARM Cortex-M0, sem FPU, 8 KiB de SRAM.
+ *   Inspecao pelo depurador (ST-Link). Nao ha UART nem printf.
+ *
+ * Permissao de uso (copyright)
+ *   Codigo academico de Tales Rodrigues, 2026. Pode ser lido, compilado
+ *   e adaptado em atividades de ensino, com citacao do autor.
+ *   Nao autoriza uso clinico nem diagnostico.
+ *
+ * Origem do codigo
+ *   Proprio: geracao do sinal, reducao de argumento de seno e cosseno,
+ *   matriz de recorrencia e o DET.
+ *   Legado: o ruido usa o gerador linear de Numerical Recipes
+ *   (1664525 e 1013904223). Nao ha copia de HAL ou de outra RQA.
+ *   Gerado: nenhum. Este arquivo nao sai do STM32CubeMX.
+ *
+ * Como usar
+ *   Inclua este fonte no projeto da placa, com Heap_Size = 0 e
+ *   Stack_Size = 0x50. Nao ligue a HAL: o BSS dela nao cabe junto
+ *   com a matriz. Grave o firmware, rode o depurador e escreva
+ *   simular_anomalia (0 ou 1). Leia determinismo_det e
+ *   anomalia_transicao_estado a cada volta do laco.
+ *
+ * Entrada
+ *   simular_anomalia (uint8_t), escrito pelo depurador com o alvo
+ *   rodando. 0: mistura irregular, modelo de repouso. 1: ritmo de
+ *   3 Hz com harmonicos, modelo ritmico. Nao e EEG medido.
+ *
+ * Saida
+ *   determinismo_det (float, 0 a 1) e anomalia_transicao_estado
+ *   (uint8_t, 1 se o DET passa de 0,70). Valores estaveis por volta:
+ *   modo 0 perto de 0,55 e alarme 0; modo 1 perto de 0,89 e alarme 1.
+ *   main nao retorna: o laco e infinito.
+ * =============================================================================
+ *
  * Analise de Quantificacao de Recorrencia (RQA) para EEG sintetico.
- * Versao otimizada para microcontrolador ARM Cortex-M0 sem FPU.
+ * Versao para microcontrolador ARM Cortex-M0 sem FPU.
  *
  * Esta implementacao usa dimensao de imersao m=1 e atraso tau=1:
  * cada estado e uma unica amplitude, sem reconstrucao multidimensional
@@ -113,8 +168,20 @@ _Static_assert(sizeof(eeg_sinal) + sizeof(matriz_recorrencia)
 /* ------------------------------------------------------------------ */
 
 /*
- * sinf restrito a |angulo| <= pi/4.  No bordo, sen(pi/4) = cos(pi/4)
- * e a constante SIN_PI_4_F substitui a chamada a rem_pio2.
+ * seno_faixa_segura
+ *
+ * Comportamento
+ *   senf restrito a |angulo| <= pi/4. No bordo, sen(pi/4) = cos(pi/4)
+ *   e a constante SIN_PI_4_F substitui a chamada a rem_pio2.
+ *
+ * Parametros
+ *   angulo: radianos, ja reduzidos a cerca de pi/4.
+ *
+ * Retorno
+ *   Seno do angulo, em float.
+ *
+ * Globais afetadas
+ *   Nenhuma.
  */
 static float seno_faixa_segura(float angulo)
 {
@@ -132,6 +199,22 @@ static float seno_faixa_segura(float angulo)
     return SIN_PI_4_F;
 }
 
+/*
+ * cosseno_faixa_segura
+ *
+ * Comportamento
+ *   cosf restrito a |angulo| <= pi/4. Fora desse teto devolve SIN_PI_4_F,
+ *   que e o valor de cos(pi/4), sem chamar a reducao da libm.
+ *
+ * Parametros
+ *   angulo: radianos, ja reduzidos a cerca de pi/4.
+ *
+ * Retorno
+ *   Cosseno do angulo, em float.
+ *
+ * Globais afetadas
+ *   Nenhuma.
+ */
 static float cosseno_faixa_segura(float angulo)
 {
     if (angulo < 0.0f) {
@@ -145,9 +228,23 @@ static float cosseno_faixa_segura(float angulo)
 }
 
 /*
- * sen(x) para x >= 0, com uma unica chamada a sinf ou cosf.
- * A reducao modulo 2*pi cabe em float32 porque os angulos daqui
- * ficam abaixo de ~40 voltas (indice 0..87).
+ * seno_reduzido
+ *
+ * Comportamento
+ *   sen(x) para x >= 0, com uma unica chamada a sinf ou cosf.
+ *   Reduz o angulo modulo 2*pi e depois a um quadrante de pi/4.
+ *   A reducao cabe em float32 porque os angulos daqui ficam abaixo
+ *   de cerca de 40 voltas (indice 0..87).
+ *
+ * Parametros
+ *   x: angulo em radianos. Valor negativo e refletido para positivo,
+ *   o que vale para o uso deste arquivo (argumentos W*t com t >= 0).
+ *
+ * Retorno
+ *   Seno de x, em float.
+ *
+ * Globais afetadas
+ *   Nenhuma.
  */
 static float seno_reduzido(float x)
 {
@@ -192,7 +289,21 @@ static float seno_reduzido(float x)
     return -cosseno_faixa_segura(angulo - TRES_MEIO_PI_F);
 }
 
-/* cos(x) = sen(x + pi/2), com a mesma reducao de argumento. */
+/*
+ * cosseno_reduzido
+ *
+ * Comportamento
+ *   cos(x) = sen(x + pi/2), com a mesma reducao de argumento.
+ *
+ * Parametros
+ *   x: angulo em radianos.
+ *
+ * Retorno
+ *   Cosseno de x, em float.
+ *
+ * Globais afetadas
+ *   Nenhuma.
+ */
 static float cosseno_reduzido(float x)
 {
     return seno_reduzido(x + MEIO_PI_F);
@@ -224,6 +335,16 @@ static float cosseno_reduzido(float x)
  *
  * A semente do LCG e rearmada a cada chamada para garantir
  * reprodutibilidade entre iteracoes do laco principal.
+ *
+ * Parametros
+ *   Nenhum.
+ *
+ * Retorno
+ *   Nenhum (void).
+ *
+ * Globais afetadas
+ *   Le: simular_anomalia.
+ *   Escreve: eeg_sinal.
  */
 void gerar_sinal_dinamica(void)
 {
@@ -290,6 +411,17 @@ void gerar_sinal_dinamica(void)
  * Etapa 3 — Classificacao:
  *   O limiar empirico 0.70 separa somente os dois sinais deste teste;
  *   nao e um limiar clinico validado.
+ *
+ * Parametros
+ *   Nenhum.
+ *
+ * Retorno
+ *   Nenhum (void).
+ *
+ * Globais afetadas
+ *   Le: eeg_sinal.
+ *   Escreve: matriz_recorrencia, determinismo_det,
+ *   anomalia_transicao_estado.
  */
 void calcular_rqa(void)
 {
@@ -368,9 +500,25 @@ void calcular_rqa(void)
 /* ------------------------------------------------------------------ */
 
 /*
- * Laco infinito: gera o sinal e recalcula o RQA continuamente.
- * O debugger le determinismo_det e anomalia_transicao_estado a cada
- * volta, e pode alterar simular_anomalia a qualquer momento.
+ * main
+ *
+ * Comportamento
+ *   Laco infinito: gera o sinal e recalcula o RQA continuamente.
+ *   O debugger le determinismo_det e anomalia_transicao_estado a cada
+ *   volta, e pode alterar simular_anomalia a qualquer momento.
+ *
+ * Parametros
+ *   Nenhum.
+ *
+ * Retorno
+ *   Declarado como int para o contrato usual de main. O laco nao
+ *   termina, entao a funcao nao devolve valor.
+ *
+ * Globais afetadas
+ *   Nenhuma diretamente. gerar_sinal_dinamica e calcular_rqa alteram
+ *   eeg_sinal, matriz_recorrencia, determinismo_det e
+ *   anomalia_transicao_estado. simular_anomalia e lida por elas e
+ *   escrita de fora, pelo depurador.
  */
 int main(void)
 {
